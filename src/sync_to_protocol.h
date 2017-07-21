@@ -93,6 +93,7 @@ struct SyncToProtocol {
 
 				expect_verb(Commands::ROWS);
 				handle_rows_command(table, row_replacer);
+				if (worker.verbose > 1) cout << timestamp() << " .. rows " << table_job.table.name << ' ' << values_list(client, table_job.table, prev_key) << ' ' << values_list(client, table_job.table, last_key) << " done" << endl;
 
 			} else if (!table_job.ranges_to_check.empty()) {
 				ColumnValues prev_key, last_key;
@@ -112,6 +113,7 @@ struct SyncToProtocol {
 				const Hash &our_hash(hasher.finish());
 
 				// now read their response
+				if (worker.verbose > 1) cout << timestamp() << " .. hash " << table_job.table.name << ' ' << values_list(client, table_job.table, prev_key) << ' ' << values_list(client, table_job.table, last_key) << ' ' << rows_to_hash << " ready" << endl;
 				expect_verb(Commands::HASH);
 				size_t _rows_to_hash, their_row_count;
 				string their_hash;
