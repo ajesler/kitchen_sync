@@ -6,7 +6,7 @@ struct TableJob {
 	TableJob(const Table &table): table(table) {}
 
 	const Table &table;
-	list<KeyRange> ranges_to_retrieve;
+	deque<KeyRange> ranges_to_retrieve;
 	deque<KeyRangeWithRowCount> ranges_to_check;
 };
 
