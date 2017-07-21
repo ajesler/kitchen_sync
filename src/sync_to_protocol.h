@@ -1,5 +1,5 @@
 typedef tuple<ColumnValues, ColumnValues> KeyRange;
-typedef tuple<ColumnValues, ColumnValues, size_t> KeyRangeWithRowCount;
+typedef tuple<ColumnValues, ColumnValues, size_t, size_t> KeyRangeWithRowCount;
 const size_t UNKNOWN_ROW_COUNT = numeric_limits<size_t>::max();
 
 struct TableJob {
@@ -20,8 +20,7 @@ struct SyncToProtocol {
 		output(worker.output),
 		hash_algorithm(worker.configured_hash_algorithm),
 		target_minimum_block_size(1),
-		target_maximum_block_size(DEFAULT_MAXIMUM_BLOCK_SIZE),
-		rows_to_scan_forward_next(1) {
+		target_maximum_block_size(DEFAULT_MAXIMUM_BLOCK_SIZE) {
 	}
 
 	void negotiate_target_minimum_block_size() {
@@ -94,12 +93,10 @@ struct SyncToProtocol {
 
 			} else if (!table_job.ranges_to_check.empty()) {
 				ColumnValues prev_key, last_key;
-				size_t estimated_rows_in_range;
+				size_t estimated_rows_in_range, rows_to_hash;
 
-				tie(prev_key, last_key, estimated_rows_in_range) = table_job.ranges_to_check.front();
+				tie(prev_key, last_key, estimated_rows_in_range, rows_to_hash) = table_job.ranges_to_check.front();
 				table_job.ranges_to_check.pop_front();
-
-				size_t rows_to_hash = decide_rows_to_hash(estimated_rows_in_range);
 
 				// tell the other end to hash this range
 				if (worker.verbose > 1) cout << "<- hash " << table_job.table.name << ' ' << values_list(client, table_job.table, prev_key) << ' ' << values_list(client, table_job.table, last_key) << ' ' << rows_to_hash << endl;
@@ -133,20 +130,11 @@ struct SyncToProtocol {
 					// the rest of the table); queue it to be scanned
 					if (estimated_rows_in_range == UNKNOWN_ROW_COUNT) {
 						// we're scanning forward, do that last
-						table_job.ranges_to_check.push_back(make_tuple(hasher.last_key, last_key, UNKNOWN_ROW_COUNT));
-
-						if (match) {
-							// on the next iteration, scan more rows per iteration, to reduce the impact of latency between the ends -
-							// up to a point, after which the cost of re-work when we finally run into a mismatch outweights the
-							// benefit of the latency savings
-							increase_scan_size(hasher);
-						} else {
-							// on the next iteration, scan fewer rows per iteration, to reduce the cost of re-work (down to a point)
-							decrease_scan_size(hasher);
-						}
+						table_job.ranges_to_check.push_back(make_tuple(hasher.last_key, last_key, UNKNOWN_ROW_COUNT, rows_to_scan_forward_next(rows_to_hash, match, hasher)));
 					} else {
 						// we're hunting errors, do that first
-						table_job.ranges_to_check.push_front(make_tuple(hasher.last_key, last_key, estimated_rows_in_range - hasher.row_count));
+						size_t rows_remaining = estimated_rows_in_range - hasher.row_count;
+						table_job.ranges_to_check.push_front(make_tuple(hasher.last_key, last_key, rows_remaining, rows_remaining));
 					}
 				}
 
@@ -220,7 +208,7 @@ struct SyncToProtocol {
 		// to express start-inclusive ranges to the sync methods, so we queue a sync from the start (empty key value)
 		// up to the last key, but this results in no actual inefficiency because they'd see the same rows anyway.
 		if (!our_last_key.empty()) {
-			table_job.ranges_to_check.push_back(make_tuple(ColumnValues(), our_last_key, UNKNOWN_ROW_COUNT));
+			table_job.ranges_to_check.push_back(make_tuple(ColumnValues(), our_last_key, UNKNOWN_ROW_COUNT, 1 /* start with 1 row and build up */));
 		}
 	}
 
@@ -240,40 +228,40 @@ struct SyncToProtocol {
 		// the part that we checked has an error; decide whether it's large enough to subdivide
 		if (hasher.row_count > 1 && hasher.size > target_minimum_block_size) {
 			// yup, queue it up for another iteration of hashing
-			table_job.ranges_to_check.push_front(make_tuple(prev_key, hasher.last_key, hasher.row_count));
+			table_job.ranges_to_check.push_front(make_tuple(prev_key, hasher.last_key, hasher.row_count, decide_rows_to_hash(hasher.row_count)));
 		} else {
 			// not worth subdividing the range any further, queue it to be retrieved
 			table_job.ranges_to_retrieve.push_back(make_tuple(prev_key, hasher.last_key));
 		}
 	}
 
-	inline size_t decide_rows_to_hash(size_t estimated_rows_in_range) {
-		if (estimated_rows_in_range == UNKNOWN_ROW_COUNT) {
-			// scan forward
-			return rows_to_scan_forward_next;
-		} else if (estimated_rows_in_range > 3) {
+	inline size_t decide_rows_to_hash(size_t rows_in_range) {
+		if (rows_in_range > 3) {
 			// break the range into two
-			return  estimated_rows_in_range/2;
+			return rows_in_range/2;
 		} else {
 			// down to single-row territory already
 			return 1;
 		}
 	}
 
-	inline void increase_scan_size(const RowHasher &hasher) {
-		if (hasher.size <= target_maximum_block_size/2) {
-			rows_to_scan_forward_next = hasher.row_count*2;
+	inline size_t rows_to_scan_forward_next(size_t rows_scanned, bool match, const RowHasher &hasher) {
+		if (match) {
+			// on the next iteration, scan more rows per iteration, to reduce the impact of latency between the ends -
+			// up to a point, after which the cost of re-work when we finally run into a mismatch outweights the
+			// benefit of the latency savings
+			if (hasher.size <= target_maximum_block_size/2) {
+				return hasher.row_count*2;
+			} else {
+				return max<size_t>(hasher.row_count*target_maximum_block_size/hasher.size, 1);
+			}
 		} else {
-			rows_to_scan_forward_next = max<size_t>(hasher.row_count*target_maximum_block_size/hasher.size, 1);
-		}
-	}
-
-	inline void decrease_scan_size(const RowHasher &hasher) {
-		// on the next iteration, scan fewer rows per iteration, to reduce the cost of re-work (down to a point)
-		if (hasher.size >= target_minimum_block_size*2) {
-			rows_to_scan_forward_next = max<size_t>(hasher.row_count/2, 1);
-		} else {
-			rows_to_scan_forward_next = max<size_t>(hasher.row_count*target_minimum_block_size/hasher.size, 1);
+			// on the next iteration, scan fewer rows per iteration, to reduce the cost of re-work (down to a point)
+			if (hasher.size >= target_minimum_block_size*2) {
+				return max<size_t>(hasher.row_count/2, 1);
+			} else {
+				return max<size_t>(hasher.row_count*target_minimum_block_size/hasher.size, 1);
+			}
 		}
 	}
 
@@ -285,5 +273,4 @@ struct SyncToProtocol {
 	HashAlgorithm hash_algorithm;
 	size_t target_minimum_block_size;
 	size_t target_maximum_block_size;
-	size_t rows_to_scan_forward_next;
 };
